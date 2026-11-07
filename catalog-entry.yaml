@@ -1,0 +1,29 @@
+# Draft catalog entry for the Hermes plugin catalog PR.
+# File this as plugin-catalog/recall-vault.yaml in NousResearch/hermes-agent.
+# Replace SHA with the full 40-character commit SHA of the pushed repo
+# before opening the PR. Branches, tags, and short SHAs are rejected.
+# Do not submit this file with a placeholder SHA.
+# Schema source: plugin-catalog/README.md in NousResearch/hermes-agent.
+
+name: recall-vault
+repo: https://github.com/tydavid5/recall-vault
+sha: PLACEHOLDER-FULL-40-CHARACTER-COMMIT-SHA
+description: A policy vault and memory for agent money. The agent remembers its spending rules, per-transaction cap, daily cap, confirm threshold, and allowlist, and Recall Vault blocks over-cap payments, refuses unknown recipients, and escalates over-threshold payments to human approval before any tool runs. Dry-run only, no money moves.
+maintainer: tydavid5
+tier: community
+category: tools
+requires_hermes: ">=0.23.0"
+version: "0.1.0"
+capabilities:
+  provides_tools:
+    - recall_vault_check
+    - recall_vault_policy
+    - recall_vault_set_policy
+    - recall_vault_ledger
+    - recall_vault_remember
+  provides_hooks:
+    - pre_tool_call
+    - post_tool_call
+    - pre_llm_call
+  provides_middleware: []
+  requires_env: []
