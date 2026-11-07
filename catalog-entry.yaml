@@ -7,7 +7,7 @@
 
 name: recall-vault
 repo: https://github.com/tydavid5/recall-vault
-sha: PLACEHOLDER-FULL-40-CHARACTER-COMMIT-SHA
+sha: 689460be84edd9c977c0edca1a3750fe0cb74761
 description: A policy vault and memory for agent money. The agent remembers its spending rules, per-transaction cap, daily cap, confirm threshold, and allowlist, and Recall Vault blocks over-cap payments, refuses unknown recipients, and escalates over-threshold payments to human approval before any tool runs. Dry-run only, no money moves.
 maintainer: tydavid5
 tier: community
