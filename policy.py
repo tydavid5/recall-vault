@@ -14,11 +14,15 @@ A payment check returns one of:
 
 Check order matters, and matches the Recall Wallet verification:
   1. invalid amount
-  2. per-transaction cap
-  3. daily cap
-  4. allowlist
-  5. confirm threshold
-  6. allowed
+  2. empty allowlist, which means nobody is allowed
+  3. per-transaction cap
+  4. daily cap
+  5. allowlist
+  6. confirm threshold
+  7. allowed
+
+An empty allowlist means nobody is allowed, not allow all. A missing
+allowlist falls back to the default allowlist.
 """
 
 DEFAULT_PER_TX_CAP = 1.0
@@ -39,14 +43,18 @@ def default_policy():
     }
 
 
-def check_payment(policy, amount, to_address, spent_today=0.0, confirmed=False):
+def check_payment(policy, amount, to_address, spent_today=0.0):
     """Check one payment against a policy. Never mutates state.
 
     policy: dict with per_tx_cap, daily_cap, confirm_above, allowlist.
     amount: number, in NEAR.
     to_address: string, recipient address.
     spent_today: number, NEAR already spent today.
-    confirmed: bool, the user already confirmed this payment.
+    There is no confirmed flag: a payment above the confirm threshold
+    always returns NEEDS_CONFIRMATION, and confirmation is only the
+    human approval prompt in Hermes, never a flag the model sets.
+    An explicitly empty allowlist means nobody is allowed. A missing
+    allowlist falls back to the default allowlist.
     """
     try:
         amount = float(amount)
@@ -72,12 +80,20 @@ def check_payment(policy, amount, to_address, spent_today=0.0, confirmed=False):
     per_tx_cap = float(policy.get("per_tx_cap", DEFAULT_PER_TX_CAP))
     daily_cap = float(policy.get("daily_cap", DEFAULT_DAILY_CAP))
     confirm_above = float(policy.get("confirm_above", DEFAULT_CONFIRM_ABOVE))
-    allowlist = policy.get("allowlist") or []
+    allowlist = policy.get("allowlist")
+    if allowlist is None:
+        allowlist = list(DEFAULT_ALLOWLIST)
     try:
         spent_today = float(spent_today or 0.0)
     except (TypeError, ValueError):
         spent_today = 0.0
 
+    if isinstance(allowlist, list) and len(allowlist) == 0:
+        return {
+            "decision": "BLOCKED",
+            "rule": "allowlist",
+            "reason": "Allowlist is empty, so nobody is allowed. Add an address to the allowlist before paying.",
+        }
     if amount > per_tx_cap:
         return {
             "decision": "BLOCKED",
@@ -90,13 +106,13 @@ def check_payment(policy, amount, to_address, spent_today=0.0, confirmed=False):
             "rule": "dailyCap",
             "reason": "This would take today spending to %s NEAR, over the daily cap of %s NEAR." % (_fmt(spent_today + amount), _fmt(daily_cap)),
         }
-    if allowlist and to_address not in allowlist:
+    if to_address not in allowlist:
         return {
             "decision": "BLOCKED",
             "rule": "allowlist",
             "reason": "Address %s is not on your allowlist, and new addresses need your approval first." % (to_address,),
         }
-    if amount > confirm_above and not confirmed:
+    if amount > confirm_above:
         return {
             "decision": "NEEDS_CONFIRMATION",
             "rule": "confirmThreshold",

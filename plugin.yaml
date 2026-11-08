@@ -1,5 +1,5 @@
 name: recall-vault
-version: 0.1.0
+version: 0.1.1
 description: A policy vault and memory for agent money. The agent remembers its spending rules, per-transaction cap, daily cap, confirm threshold, and allowlist, and Recall Vault blocks over-cap payments, refuses unknown recipients, and escalates over-threshold payments to human approval before any tool runs. Dry-run only, no money moves.
 author: tydavid5
 license: MIT

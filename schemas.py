@@ -24,10 +24,6 @@ CHECK = {
                 "type": "string",
                 "description": "Currency. Only NEAR is supported in this version.",
             },
-            "confirmed": {
-                "type": "boolean",
-                "description": "True when the user already confirmed this payment.",
-            },
         },
         "required": ["amount", "to"],
     },
@@ -52,7 +48,11 @@ SET_POLICY = {
     "description": (
         "Update the Recall Vault money policy. Give only the fields to change. "
         "Caps and threshold are in NEAR. Allowlist replaces the whole list. "
-        "Set reset_spent to true to reset today's spent total to zero."
+        "An empty allowlist means nobody is allowed, not allow all. "
+        "Set reset_spent to true to reset today's spent total to zero. "
+        "A model call to this tool is sent to the human approval gate first, "
+        "which shows the exact change, and the user can also change policy "
+        "with the user-only /recall-vault set command."
     ),
     "parameters": {
         "type": "object",
@@ -72,7 +72,7 @@ SET_POLICY = {
             "allowlist": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Full replacement allowlist of recipient addresses.",
+                "description": "Full replacement allowlist of recipient addresses. An empty list means nobody is allowed, not allow all.",
             },
             "reset_spent": {
                 "type": "boolean",
@@ -107,7 +107,8 @@ REMEMBER = {
         "Remember a plain-language money rule for the agent, for example "
         "Never pay a brand-new address without asking first. Remembered rules "
         "are shown to the agent every turn. Enforcement uses the numeric "
-        "policy caps, threshold, and allowlist."
+        "policy caps, threshold, and allowlist. A model call to this tool is "
+        "sent to the human approval gate first, which shows the rule text."
     ),
     "parameters": {
         "type": "object",

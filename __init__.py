@@ -11,6 +11,16 @@ Dry-run only in this version: no real money moves, no transaction
 hashes are faked, and the NEAR payment itself is not executed by this
 plugin. recall_vault_check is a dry check that logs its decision.
 
+Changes in 0.1.1, after catalog review: model calls to
+recall_vault_set_policy and recall_vault_remember are sent to the human
+approval gate, with the exact change shown, instead of running free.
+The user changes policy directly with the user-only /recall-vault set
+command. An empty allowlist means nobody is allowed. Payments sent to
+approval are recorded as pending, keyed by tool_call_id, so approved
+payments count toward the daily cap. The model-set confirmed flag on
+recall_vault_check is gone; confirmation is only the human approval
+prompt in Hermes.
+
 Ported from Recall Wallet, whose NEAR testnet vault was verified with
 per-transaction cap 1 NEAR, daily cap 2 NEAR, confirm threshold 0.5 NEAR,
 and allowlist [recallwallet-freelancer.testnet].
@@ -22,12 +32,12 @@ import threading
 
 try:
     from . import schemas, tools
-    from .policy import check_payment
+    from .policy import check_payment, default_policy
     from . import store
 except ImportError:
     import schemas
     import tools
-    from policy import check_payment
+    from policy import check_payment, default_policy
     import store
 
 logger = logging.getLogger(__name__)
@@ -65,10 +75,53 @@ _RECIPIENT_KEYS = (
     "account",
 )
 
-# Payments the pre_tool_call hook allowed, waiting for post_tool_call
-# to confirm the tool actually ran. Keyed by task_id.
+# Payments the pre_tool_call hook allowed or sent to approval, waiting
+# for post_tool_call to confirm the tool actually ran. Keyed by
+# tool_call_id when Hermes passes one, else by task_id, so two calls in
+# one task never clobber each other.
 _PENDING = {}
 _PENDING_LOCK = threading.Lock()
+
+
+def _pending_key(tool_call_id, task_id):
+    """Key for one pending payment: the tool call id, else the task id."""
+    if tool_call_id:
+        return "call:%s" % str(tool_call_id)
+    return "task:%s" % str(task_id or "")
+
+
+def _set_policy_diff(args):
+    """Plain-language diff of a set_policy call, old value to new value."""
+    try:
+        state = store.load_state()
+        policy = state["policy"]
+        spent_today = state["spent_today"]
+    except Exception:
+        policy = default_policy()
+        spent_today = 0.0
+    parts = []
+    if not isinstance(args, dict) or not args:
+        parts.append("no field given")
+    else:
+        for key in ("per_tx_cap", "daily_cap", "confirm_above"):
+            if key in args and args.get(key) is not None:
+                parts.append("%s: %s -> %s" % (key, policy.get(key), args.get(key)))
+        if "allowlist" in args and args.get("allowlist") is not None:
+            old = list(policy.get("allowlist") or [])
+            new = args.get("allowlist")
+            new = list(new) if isinstance(new, list) else new
+            parts.append("allowlist: %s -> %s" % (old, new))
+        if args.get("reset_spent"):
+            parts.append(
+                "reset_spent: false -> true (spent today %s -> 0.0)" % spent_today
+            )
+    if not parts:
+        parts.append("no recognised field given")
+    return (
+        "Recall Vault policy change needs your approval: %s. "
+        "Approve only if you, the user, asked for this change."
+        % "; ".join(parts)
+    )
 
 
 def _extract_payment(tool_name, args):
@@ -102,10 +155,30 @@ def _extract_payment(tool_name, args):
     return amount, to_address
 
 
-def _pre_tool_call(tool_name, args, task_id, **kwargs):
+def _pre_tool_call(tool_name, args, task_id, tool_call_id=None, **kwargs):
     """Hook: before any tool executes. Blocks or escalates payments only."""
     try:
-        if str(tool_name or "").startswith("recall_vault_"):
+        name = str(tool_name or "")
+        # Loosening the guard needs a human. A model call to set_policy
+        # or remember goes to the approval gate with the exact change
+        # shown, so a prompt-injected turn cannot loosen the guard and
+        # then pay. The user-only /recall-vault set command is not a
+        # model tool call, so it is not gated here.
+        if name == "recall_vault_set_policy":
+            return {"action": "approve", "message": _set_policy_diff(args)}
+        if name == "recall_vault_remember":
+            rule = ""
+            if isinstance(args, dict):
+                rule = str(args.get("rule") or "").strip()
+            return {
+                "action": "approve",
+                "message": (
+                    "Recall Vault rule to remember needs your approval: "
+                    '"%s". Remembered rules are shown to the model every turn.'
+                    % rule
+                ),
+            }
+        if name.startswith("recall_vault_"):
             return None
         payment = _extract_payment(tool_name, args)
         if payment is None:
@@ -124,7 +197,6 @@ def _pre_tool_call(tool_name, args, task_id, **kwargs):
             amount,
             to_address,
             spent_today=state["spent_today"],
-            confirmed=False,
         )
         decision = result["decision"]
         if decision == "BLOCKED":
@@ -150,33 +222,41 @@ def _pre_tool_call(tool_name, args, task_id, **kwargs):
                     "tool": tool_name,
                 }
             )
+            # Record it as pending too, so an approved payment counts
+            # toward the daily cap once the tool runs clean.
+            with _PENDING_LOCK:
+                _PENDING[_pending_key(tool_call_id, task_id)] = {
+                    "tool": tool_name,
+                    "amount": amount,
+                    "to": to_address,
+                }
             return {"action": "approve", "message": result["reason"]}
         with _PENDING_LOCK:
-            _PENDING.setdefault(str(task_id or ""), []).append(
-                {"tool": tool_name, "amount": amount, "to": to_address}
-            )
+            _PENDING[_pending_key(tool_call_id, task_id)] = {
+                "tool": tool_name,
+                "amount": amount,
+                "to": to_address,
+            }
         return None
     except Exception as exc:
         logger.warning("Recall Vault pre_tool_call failed: %s", exc)
         return None
 
 
-def _post_tool_call(tool_name, args, result, task_id, duration_ms=None, **kwargs):
-    """Hook: after any tool returns. Logs allowed payments that ran."""
+def _post_tool_call(tool_name, args, result, task_id, duration_ms=None, tool_call_id=None, **kwargs):
+    """Hook: after any tool returns. Logs payments that ran, by call id."""
     try:
         if str(tool_name or "").startswith("recall_vault_"):
             return None
+        key = _pending_key(tool_call_id, task_id)
         with _PENDING_LOCK:
-            pending = _PENDING.pop(str(task_id or ""), [])
-        if not pending:
-            return None
-        entry = None
-        for item in pending:
-            if item["tool"] == tool_name:
-                entry = item
-                break
+            entry = _PENDING.pop(key, None)
         if entry is None:
-            entry = pending[0]
+            return None
+        if entry["tool"] != tool_name:
+            with _PENDING_LOCK:
+                _PENDING[key] = entry
+            return None
         text = result if isinstance(result, str) else json.dumps(result or "")
         lowered = text.lower()
         if '"error"' in lowered or '"ok": false' in lowered or "error:" in lowered:
@@ -193,7 +273,13 @@ def _pre_llm_call(session_id=None, user_message=None, conversation_history=None,
     try:
         state = store.load_state()
         policy = state["policy"]
-        allowlist = ", ".join(policy.get("allowlist") or []) or "none set"
+        allowlist = policy.get("allowlist")
+        if allowlist:
+            allowlist_text = ", ".join(allowlist)
+        elif isinstance(allowlist, list):
+            allowlist_text = "empty, nobody is allowed"
+        else:
+            allowlist_text = "none set"
         rules = "; ".join(state["rules"][:4]) if state["rules"] else "none"
         text = (
             "Recall Vault money rules (NEAR, dry-run, no money moves): "
@@ -207,7 +293,7 @@ def _pre_llm_call(session_id=None, user_message=None, conversation_history=None,
                 policy.get("daily_cap"),
                 policy.get("confirm_above"),
                 state["spent_today"],
-                allowlist,
+                allowlist_text,
                 rules,
             )
         )
@@ -218,13 +304,14 @@ def _pre_llm_call(session_id=None, user_message=None, conversation_history=None,
 
 
 def _handle_recall_vault(raw_args, **kwargs):
-    """Slash command: /recall-vault [policy|ledger|check <amount> <to>|remember <rule>]"""
+    """Slash command: /recall-vault [policy|ledger|check <amount> <to>|remember <rule>|set <key=value> ...]"""
     try:
         text = str(raw_args or "").strip()
         if not text or text == "help":
             return (
                 "Recall Vault: /recall-vault policy | /recall-vault ledger | "
-                "/recall-vault check <amount> <to> | /recall-vault remember <rule>"
+                "/recall-vault check <amount> <to> | /recall-vault remember <rule> | "
+                "/recall-vault set per_tx_cap=1 daily_cap=2 confirm_above=0.5 allowlist=a,b reset_spent=true"
             )
         parts = text.split(None, 1)
         command = parts[0].lower()
@@ -234,6 +321,11 @@ def _handle_recall_vault(raw_args, **kwargs):
             if not payload.get("ok"):
                 return "Recall Vault: %s" % payload.get("error", "policy failed.")
             policy = payload
+            allowlist = ", ".join(policy.get("allowlist") or [])
+            if isinstance(policy.get("allowlist"), list) and len(policy["allowlist"]) == 0:
+                allowlist = "empty, nobody is allowed"
+            elif not allowlist:
+                allowlist = "none set"
             return (
                 "Recall Vault policy (NEAR, dry-run): per-transaction cap %s, "
                 "daily cap %s, confirm above %s, spent today %s, "
@@ -243,7 +335,7 @@ def _handle_recall_vault(raw_args, **kwargs):
                     policy.get("daily_cap"),
                     policy.get("confirm_above"),
                     policy.get("spent_today"),
-                    ", ".join(policy.get("allowlist") or []) or "none set",
+                    allowlist,
                     "; ".join(policy.get("rules") or []) or "none",
                 )
             )
@@ -285,10 +377,64 @@ def _handle_recall_vault(raw_args, **kwargs):
             if not payload.get("ok"):
                 return "Recall Vault: %s" % payload.get("error", "remember failed.")
             return "Remembered: %s" % rest.strip()
+        if command == "set":
+            if not rest.strip():
+                return (
+                    "Usage: /recall-vault set per_tx_cap=1 daily_cap=2 "
+                    "confirm_above=0.5 allowlist=a,b reset_spent=true. "
+                    "An empty allowlist (allowlist=) means nobody is allowed."
+                )
+            parsed = {}
+            for token in rest.split():
+                if "=" not in token:
+                    return "Bad field %r. Use key=value, for example per_tx_cap=1." % token
+                key, value = token.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key in ("per_tx_cap", "daily_cap", "confirm_above"):
+                    try:
+                        parsed[key] = float(value)
+                    except ValueError:
+                        return "Bad value for %s: %r must be a number." % (key, value)
+                elif key == "allowlist":
+                    parsed["allowlist"] = (
+                        [a.strip() for a in value.split(",") if a.strip()]
+                        if value
+                        else []
+                    )
+                elif key == "reset_spent":
+                    parsed["reset_spent"] = value.lower() in ("true", "1", "yes", "y")
+                else:
+                    return (
+                        "Unknown policy field %r. Use per_tx_cap, daily_cap, "
+                        "confirm_above, allowlist, or reset_spent." % key
+                    )
+            if not parsed:
+                return (
+                    "Usage: /recall-vault set per_tx_cap=1 daily_cap=2 "
+                    "confirm_above=0.5 allowlist=a,b reset_spent=true"
+                )
+            payload = json.loads(tools.recall_vault_set_policy(parsed))
+            if not payload.get("ok"):
+                return "Recall Vault: %s" % payload.get("error", "set policy failed.")
+            policy = payload.get("policy") or {}
+            return (
+                "Policy updated: changed %s. Per-transaction cap %s, "
+                "daily cap %s, confirm above %s, spent today %s, "
+                "allowlist: %s"
+                % (
+                    ", ".join(payload.get("changed") or []),
+                    policy.get("per_tx_cap"),
+                    policy.get("daily_cap"),
+                    policy.get("confirm_above"),
+                    payload.get("spent_today"),
+                    ", ".join(policy.get("allowlist") or []) or "empty, nobody is allowed",
+                )
+            )
         return (
             "Unknown Recall Vault command. Try: /recall-vault policy | "
             "/recall-vault ledger | /recall-vault check <amount> <to> | "
-            "/recall-vault remember <rule>"
+            "/recall-vault remember <rule> | /recall-vault set per_tx_cap=1 daily_cap=2 confirm_above=0.5 allowlist=a,b reset_spent=true"
         )
     except Exception as exc:
         return "Recall Vault command failed: %s" % (exc,)
@@ -333,5 +479,5 @@ def register(ctx):
         "recall-vault",
         handler=_handle_recall_vault,
         description="Show Recall Vault policy, ledger, or check a payment",
-        args_hint="[policy|ledger|check <amount> <to>|remember <rule>]",
+        args_hint="[policy|ledger|check <amount> <to>|remember <rule>|set <key=value> ...]",
     )

@@ -39,7 +39,8 @@ def recall_vault_check(args, **kwargs):
         amount = args.get("amount")
         to_address = str(args.get("to") or "").strip()
         currency = str(args.get("currency") or "NEAR").strip().upper()
-        confirmed = bool(args.get("confirmed", False))
+        # Any confirmed argument from the model is ignored. Confirmation
+        # is only the human approval prompt in Hermes, never a model flag.
         if amount is None or not to_address:
             return _error("Need amount and to.")
         if currency != "NEAR":
@@ -55,7 +56,6 @@ def recall_vault_check(args, **kwargs):
             amount,
             to_address,
             spent_today=state["spent_today"],
-            confirmed=confirmed,
         )
         decision = result["decision"]
         if decision == "ALLOWED":
@@ -108,21 +108,22 @@ def recall_vault_policy(args, **kwargs):
         data_dir = _data_dir(kwargs)
         state = store.load_state(data_dir=data_dir)
         policy = state["policy"]
-        return _ok(
-            {
-                "ok": True,
-                "currency": policy.get("currency", "NEAR"),
-                "per_tx_cap": policy.get("per_tx_cap"),
-                "daily_cap": policy.get("daily_cap"),
-                "confirm_above": policy.get("confirm_above"),
-                "allowlist": policy.get("allowlist"),
-                "spent_today": state["spent_today"],
-                "spent_day": state["spent_day"],
-                "rules": state["rules"],
-                "dry_run": True,
-                "note": "Dry-run only, no money moves.",
-            }
-        )
+        payload = {
+            "ok": True,
+            "currency": policy.get("currency", "NEAR"),
+            "per_tx_cap": policy.get("per_tx_cap"),
+            "daily_cap": policy.get("daily_cap"),
+            "confirm_above": policy.get("confirm_above"),
+            "allowlist": policy.get("allowlist"),
+            "spent_today": state["spent_today"],
+            "spent_day": state["spent_day"],
+            "rules": state["rules"],
+            "dry_run": True,
+            "note": "Dry-run only, no money moves.",
+        }
+        if isinstance(policy.get("allowlist"), list) and len(policy["allowlist"]) == 0:
+            payload["allowlist_note"] = "Empty allowlist means nobody is allowed, not allow all."
+        return _ok(payload)
     except Exception as exc:
         return _error("Recall Vault policy failed: %s" % (exc,))
 

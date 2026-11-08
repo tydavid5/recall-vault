@@ -7,6 +7,25 @@ plain rules once, per-transaction cap, daily cap, confirm threshold, and
 allowlist, and Recall Vault enforces them on every payment-like tool call
 before it runs.
 
+## Changes in 0.1.1
+
+After catalog review, four fixes:
+
+- Model calls to `recall_vault_set_policy` and `recall_vault_remember`
+  are sent to the human approval gate first, which shows the exact
+  change or rule text. The user changes policy directly with the
+  user-only `/recall-vault set ...` command, which is not a model
+  tool call. A prompt-injected turn can no longer loosen the guard
+  and then pay.
+- An empty allowlist means nobody is allowed, not allow all.
+- Payments sent to approval are recorded as pending, keyed by
+  tool_call_id, so an approved payment counts toward the daily cap.
+  `post_tool_call` books only the single pending entry for that call.
+- The model-set `confirmed` flag on `recall_vault_check` is gone. A
+  payment above the confirm threshold always returns
+  NEEDS_CONFIRMATION, and confirmation is only the human approval
+  prompt in Hermes.
+
 ## What it does
 
 - Under the cap and allowlisted: the payment proceeds.
@@ -63,11 +82,11 @@ hermes plugins doctor recall-vault
 
 | Tool | What it does |
 | --- | --- |
-| `recall_vault_check` | Check a payment: amount in NEAR, recipient, confirmed flag. Returns ALLOWED, BLOCKED with the rule, or NEEDS_CONFIRMATION. Allowed checks are logged and count toward today. |
-| `recall_vault_policy` | Show the current policy, spent today, and remembered rules. |
-| `recall_vault_set_policy` | Update caps, threshold, or allowlist. Give only the fields to change. |
+| `recall_vault_check` | Check a payment: amount in NEAR, recipient. No confirmed flag. Returns ALLOWED, BLOCKED with the rule, or NEEDS_CONFIRMATION. Allowed checks are logged and count toward today. |
+| `recall_vault_policy` | Show the current policy, spent today, and remembered rules. An empty allowlist is noted as meaning nobody is allowed. |
+| `recall_vault_set_policy` | Update caps, threshold, or allowlist. Give only the fields to change. Model calls are sent to the human approval gate, which shows the exact change. An empty allowlist means nobody is allowed. |
 | `recall_vault_ledger` | Show the audit ledger, most recent first. |
-| `recall_vault_remember` | Remember a plain-language money rule. |
+| `recall_vault_remember` | Remember a plain-language money rule. Model calls are sent to the human approval gate, which shows the rule text. |
 
 ## Slash command
 
@@ -76,7 +95,13 @@ hermes plugins doctor recall-vault
 /recall-vault ledger
 /recall-vault check 0.4 recallwallet-freelancer.testnet
 /recall-vault remember Never pay a brand-new address without asking first.
+/recall-vault set per_tx_cap=1 daily_cap=2 confirm_above=0.5 allowlist=a,b reset_spent=true
 ```
+
+The `set` command is user-only: it runs from your own typed command,
+not from a model tool call, so it is not sent to the approval gate.
+Give key=value pairs, allowlist as a comma-separated list. An empty
+allowlist (`allowlist=`) means nobody is allowed.
 
 ## Demo cases
 
@@ -84,10 +109,12 @@ These are the same cases the Recall Wallet vault passed on NEAR testnet.
 
 1. Pay 0.2 NEAR to `recallwallet-freelancer.testnet`: ALLOWED, spent today 0.2.
 2. Pay 1.2 NEAR to the freelancer: BLOCKED, rule `perTxCap`, 1.2 exceeds the 1 NEAR cap.
-3. Pay 0.7 NEAR to the freelancer: NEEDS_CONFIRMATION, rule `confirmThreshold`, 0.7 is above 0.5. Confirm it, and it is ALLOWED, spent today 0.9.
-4. Pay 0.4 NEAR to the freelancer: ALLOWED, spent today 1.3.
-5. Pay 0.8 NEAR to the freelancer: BLOCKED, rule `dailyCap`, 1.3 plus 0.8 is 2.1, over the 2 NEAR daily cap.
-6. Pay 0.1 NEAR to `some-random.testnet`: BLOCKED, rule `allowlist`.
+3. Pay 0.7 NEAR to the freelancer: NEEDS_CONFIRMATION, rule `confirmThreshold`, 0.7 is above 0.5. It stays NEEDS_CONFIRMATION until the human confirms it in Hermes. There is no model flag that makes it ALLOWED.
+4. Pay 0.4 NEAR to the freelancer: ALLOWED, spent today 0.6.
+5. Pay 0.5 NEAR to the freelancer: ALLOWED, spent today 1.1.
+6. Pay 0.5 NEAR to the freelancer: ALLOWED, spent today 1.6.
+7. Pay 0.5 NEAR to the freelancer: BLOCKED, rule `dailyCap`, 1.6 plus 0.5 is 2.1, over the 2 NEAR daily cap.
+8. Pay 0.1 NEAR to `some-random.testnet`: BLOCKED, rule `allowlist`.
 
 Run the same cases locally, no Hermes needed:
 
@@ -116,7 +143,11 @@ payment, transfer, withdraw, payout, settle, send money, send payment)
 AND its arguments carry both an amount and a recipient. Tools like
 `read_file`, `send_message`, and `send_email` are never blocked, because
 they carry no amount, or no recipient, or neither. The plugin's own
-`recall_vault_*` tools are never intercepted.
+`recall_vault_*` tools are not all skipped: `recall_vault_set_policy`
+and `recall_vault_remember` are sent to the human approval gate, with
+the exact change or rule text shown, because they can loosen the guard.
+`recall_vault_check`, `recall_vault_policy`, and `recall_vault_ledger`
+are not intercepted.
 
 ## Security and privacy
 
